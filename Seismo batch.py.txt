@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+"""
+seismo_batch.py - command-line batch companion to SeismoWeb.html
+================================================================
+Processes one or many accelerograms with exactly the same algorithms as the
+web app (bilinear Butterworth SOS filtering, polynomial baseline correction,
+trapezoidal integration, Nigam & Jennings exact SDOF solution) and writes
+CSV / JSON results.  Useful for folders of records, or as an independent
+cross-check of the browser results.
+
+    python seismo_batch.py record.txt --dt 0.01 --units g \
+           --filter bandpass --f1 0.25 --f2 25 --order 4 \
+           --baseline vel-poly --bl-order 1 --out results/
+
+    python seismo_batch.py "records/*.at2" --units g --out results/
+    python seismo_batch.py raw.txt --acc-col 1 --dt 0.01 --units g \
+           --filter bandpass --f1 1 --f2 25 --order 4 \
+           --validate corrected.txt --ref-cols 1,2,3
+
+Requires: numpy, scipy   (pip install -r requirements.txt)
+"""
+import argparse, glob, json, os, re, sys
+import numpy as np
+from scipy.signal import butter, cheby1, sosfilt, sosfiltfilt
+
+G_DEFAULT = 9.81
+UNIT_FACTOR = {'m/s2': 1.0, 'cm/s2': 0.01, 'gal': 0.01, 'mm/s2': 0.001, 'in/s2': 0.0254}
+
+# --------------------------------------------------------------------------- IO
+NUM = re.compile(r'^[+-]?((\d+\.?\d*)|(\.\d+))([eEdD][+-]?\d+)?$')
+SCI = re.compile(r'[+-]?(?:\d+\.?\d*|\.\d+)(?:[eEdD][+-]?\d+)?')
+
+def _row(line):
+    s = line.replace(',', ' ').replace(';', ' ').strip()
+    if not s:
+        return None
+    toks = s.split()
+    if all(NUM.match(t) for t in toks):
+        return [float(t.replace('d', 'e').replace('D', 'e')) for t in toks]
+    m = SCI.findall(s)                       # packed fixed-width columns
+    if len(m) >= 2 and len(''.join(m)) == len(re.sub(r'\s+', '', s)):
+        return [float(x.replace('d', 'e').replace('D', 'e')) for x in m]
+    return None
+
+def read_record(path):
+    """-> (columns list[np.ndarray], headers list[str], meta dict)"""
+    head, rows, counts = [], [], {}
+    with open(path, 'r', errors='replace') as fh:
+        for line in fh:
+            v = _row(line)
+            if v:
+                rows.append(v); counts[len(v)] = counts.get(len(v), 0) + 1
+            elif line.strip() and not rows:
+                head.append(line.rstrip('\n'))
+    if not rows:
+        raise ValueError(f'no numeric data in {path}')
+    H = '\n'.join(head)
+    meta = {'name': os.path.basename(path), 'header': H}
+    m = re.search(r'DT\s*[=:]\s*([0-9.eE+-]+)', H, re.I) or \
+        re.search(r'Time\s*Step\s*[:=]?\s*([0-9.eE+-]+)', H, re.I)
+    if m:
+        meta['dt'] = float(m.group(1))
+    m = re.search(r'NPTS\s*[=:]\s*(\d+)', H, re.I)
+    if m:
+        meta['npts'] = int(m.group(1))
+    modal = max(counts, key=counts.get)
+    flat = [x for r in rows for x in r]
+    if meta.get('npts') and (len(counts) > 1 or modal >= 3) and abs(len(flat) - meta['npts']) <= modal:
+        return [np.asarray(flat, float)], ['acceleration'], meta
+    data = np.array([r for r in rows if len(r) == modal], float)
+    cols = [data[:, i] for i in range(modal)]
+    headers = None
+    for line in reversed(head):
+        raw = re.sub(r'^\s*[#%!*]+\s?', '', line)
+        for sp in ('\t', None, ',', ';'):
+            parts = [p.strip() for p in (raw.split(sp) if sp else re.split(r'\s{2,}', raw)) if p.strip()]
+            if len(parts) == modal and not NUM.match(parts[0]):
+                headers = parts; break
+        if headers:
+            break
+    if modal == 1:
+        headers = ['acceleration']
+    if not headers:
+        headers = [f'col {i+1}' for i in range(modal)]
+    if 'dt' not in meta and modal >= 2 and len(cols[0]) > 2:
+        d = np.diff(cols[0][:500])
+        if d[0] > 0 and np.allclose(d, d[0], rtol=1e-6):
+            meta['dt'] = float(d[0]); meta['time_column'] = 0
+    return cols, headers, meta
+
+# ---------------------------------------------------------------- processing
+def baseline_correct(acc, dt, mode, order=1, pre_event=0.0, zero_at_start=False):
+    n = len(acc); t = np.arange(n) * dt
+    a = acc.astype(float).copy()
+    if mode in (None, 'none'):
+        return a
+    if pre_event and pre_event > 0:
+        m = min(n, int(round(pre_event / dt)))
+        if m > 1:
+            a -= a[:m].mean()
+    if mode == 'constant':
+        return a - a.mean() if not pre_event else a
+    if mode == 'acc-poly':
+        return a - np.polyval(np.polyfit(t, a, order), t)
+    if mode == 'vel-poly':
+        v = np.concatenate([[0.0], np.cumsum((a[1:] + a[:-1]) * 0.5 * dt)])
+        if zero_at_start:
+            q = np.polyfit(t[1:], v[1:] / t[1:], max(0, order - 1))
+            h = 1e-6 * max(dt, t[-1])
+            trend = ((t + h) * np.polyval(q, t + h) - (t - h) * np.polyval(q, t - h)) / (2 * h)
+        else:
+            p = np.polyfit(t, v, order)
+            trend = np.polyval(np.polyder(p), t)
+        return a - trend
+    raise ValueError(f'unknown baseline mode {mode}')
+
+def design(dt, ftype, btype, f1, f2, order, rp=0.5):
+    nyq = 0.5 / dt
+    wn = f2 / nyq if btype == 'lowpass' else f1 / nyq if btype == 'highpass' else [f1 / nyq, f2 / nyq]
+    if ftype == 'cheby1':
+        return cheby1(order, rp, wn, btype=btype, output='sos')
+    return butter(order, wn, btype=btype, output='sos')
+
+def apply_filter(acc, dt, btype, f1, f2, order, causal=True, ftype='butter', rp=0.5):
+    if btype in (None, 'none'):
+        return acc
+    sos = design(dt, ftype, btype, f1, f2, order, rp)
+    return sosfilt(sos, acc) if causal else sosfiltfilt(sos, acc)
+
+def integrate(acc, dt):
+    v = np.concatenate([[0.0], np.cumsum((acc[1:] + acc[:-1]) * 0.5 * dt)])
+    d = np.concatenate([[0.0], np.cumsum((v[1:] + v[:-1]) * 0.5 * dt)])
+    return v, d
+
+# ------------------------------------------------------------------- spectra
+def sdof_nigam_jennings(ag, dt, T, xi):
+    """Exact solution for a piecewise-linear ground acceleration."""
+    w = 2 * np.pi / T
+    wd = w * np.sqrt(1 - xi * xi)
+    e = np.exp(-xi * w * dt)
+    s, c = np.sin(wd * dt), np.cos(wd * dt)
+    xw, sq = xi * w, np.sqrt(1 - xi * xi)
+    A11 = e * (xw / wd * s + c);      A12 = e / wd * s
+    A21 = -e * w / sq * s;            A22 = e * (c - xw / wd * s)
+    w2, w3 = w * w, w ** 3
+    B11 = e * (((2 * xi * xi - 1) / (w2 * dt) + xi / w) * s / wd + (2 * xi / (w3 * dt) + 1 / w2) * c) - 2 * xi / (w3 * dt)
+    B12 = -e * (((2 * xi * xi - 1) / (w2 * dt)) * s / wd + (2 * xi / (w3 * dt)) * c) - 1 / w2 + 2 * xi / (w3 * dt)
+    B21 = e * (((2 * xi * xi - 1) / (w2 * dt) + xi / w) * (c - xi / sq * s) -
+               (2 * xi / (w3 * dt) + 1 / w2) * (wd * s + xw * c)) + 1 / (w2 * dt)
+    B22 = -e * (((2 * xi * xi - 1) / (w2 * dt)) * (c - xi / sq * s) -
+                (2 * xi / (w3 * dt)) * (wd * s + xw * c)) - 1 / (w2 * dt)
+    n = len(ag)
+    u = np.zeros(n); ud = np.zeros(n)
+    for i in range(n - 1):
+        u[i + 1] = A11 * u[i] + A12 * ud[i] + B11 * (-ag[i]) + B12 * (-ag[i + 1])
+        ud[i + 1] = A21 * u[i] + A22 * ud[i] + B21 * (-ag[i]) + B22 * (-ag[i + 1])
+    at = -2 * xi * w * ud - w2 * u
+    return abs(u).max(), abs(ud).max(), abs(at).max()
+
+def refine(a, k):
+    if k <= 1:
+        return a
+    n = len(a); out = np.empty((n - 1) * k + 1)
+    for j in range(k):
+        out[j:(n - 1) * k:k] = a[:-1] + (a[1:] - a[:-1]) * j / k
+    out[-1] = a[-1]
+    return out
+
+def response_spectrum(ag, dt, periods, xi, steps_per_period=40, kmin=2):
+    Sd = np.zeros(len(periods)); Sv = np.zeros_like(Sd); Sa = np.zeros_like(Sd)
+    cache_k, A, ADT = -1, ag, dt
+    for i, T in enumerate(periods):
+        k = min(64, max(kmin, int(np.ceil(dt * steps_per_period / T))))
+        if k != cache_k:
+            cache_k, A, ADT = k, refine(ag, k), dt / k
+        Sd[i], Sv[i], Sa[i] = sdof_nigam_jennings(A, ADT, T, xi)
+    w = 2 * np.pi / periods
+    return dict(T=periods, Sd=Sd, Sv=Sv, Sa=Sa, PSv=w * Sd, PSa=w * w * Sd)
+
+# --------------------------------------------------------- intensity measures
+def intensity_measures(acc, vel, disp, dt, g=G_DEFAULT, thr_g=0.05):
+    n = len(acc); dur = (n - 1) * dt
+    a2 = np.concatenate([[0.0], np.cumsum((acc[1:] ** 2 + acc[:-1] ** 2) * 0.5 * dt)])
+    Ia = np.pi / (2 * g) * a2[-1]
+    cav = np.concatenate([[0.0], np.cumsum((abs(acc[1:]) + abs(acc[:-1])) * 0.5 * dt)])
+
+    def tcross(frac):
+        tgt = frac * a2[-1]
+        i = int(np.searchsorted(a2, tgt))
+        if i <= 0 or i >= n:
+            return 0.0 if i <= 0 else dur
+        d = a2[i] - a2[i - 1]
+        return (i - 1 + ((tgt - a2[i - 1]) / d if d > 0 else 0)) * dt
+    t5, t75, t95 = tcross(.05), tcross(.75), tcross(.95)
+    over = np.abs(acc) > thr_g * g
+    idx = np.flatnonzero(over)
+    aRMS = float(np.sqrt((acc ** 2).mean()))
+    srt = np.sort(np.abs(acc)); run = np.cumsum(srt ** 2)
+    A95 = float(srt[int(np.searchsorted(run, 0.95 * run[-1]))]) if run[-1] > 0 else 0.0
+    F = np.fft.rfft(acc); f = np.fft.rfftfreq(n, dt); C = np.abs(F) * dt
+    band = (f >= 0.25) & (f <= 20)
+    Tm = float((C[band] ** 2 / f[band]).sum() / (C[band] ** 2).sum()) if band.any() else 0.0
+    return dict(
+        npts=n, dt=dt, duration=dur,
+        PGA_g=float(abs(acc).max() / g), PGA_ms2=float(abs(acc).max()),
+        PGV_cm_s=float(abs(vel).max() * 100), PGD_cm=float(abs(disp).max() * 100),
+        t_PGA=float(np.argmax(np.abs(acc)) * dt), t_PGV=float(np.argmax(np.abs(vel)) * dt),
+        t_PGD=float(np.argmax(np.abs(disp)) * dt),
+        PGV_PGA_s=float(abs(vel).max() / abs(acc).max()) if abs(acc).max() > 0 else 0.0,
+        Arias_Ia_m_s=float(Ia), CAV_m_s=float(cav[-1]),
+        SED_cm2_s=float(np.trapezoid(vel ** 2, dx=dt) * 1e4),
+        a_rms_ms2=aRMS, v_rms_cm_s=float(np.sqrt((vel ** 2).mean()) * 100),
+        d_rms_cm=float(np.sqrt((disp ** 2).mean()) * 100),
+        Ic=float(aRMS ** 1.5 * np.sqrt(max(t95 - t5, 0))),
+        t5=float(t5), t75=float(t75), t95=float(t95),
+        D_5_75_s=float(t75 - t5), D_5_95_s=float(t95 - t5),
+        D_bracketed_s=float((idx[-1] - idx[0]) * dt) if idx.size else 0.0,
+        D_uniform_s=float(over.sum() * dt), threshold_g=thr_g,
+        A95_g=A95 / g, Tm_s=Tm, T_FAS_peak_s=float(1 / f[np.argmax(C[1:]) + 1]))
+
+def spectral_im(sp, g=G_DEFAULT):
+    T, Sa, Sv, PSv = sp['T'], sp['Sa'], sp['Sv'], sp['PSv']
+    def band(y, lo, hi):
+        lo, hi = max(lo, T[0]), min(hi, T[-1])
+        if hi <= lo:
+            return 0.0
+        grid = np.unique(np.concatenate([[lo, hi], T[(T > lo) & (T < hi)]]))
+        return float(np.trapezoid(np.interp(grid, T, y), grid))
+    return dict(Sa_peak_g=float(Sa.max() / g), Tp_s=float(T[int(np.argmax(Sa))]),
+                ASI_g_s=band(Sa, .1, .5) / g, VSI_cm=band(Sv, .1, 2.5) * 100,
+                Housner_cm=band(PSv, .1, 2.5) * 100,
+                EPA_g=band(Sa, .1, .5) / .4 / 2.5 / g, EPV_cm_s=band(PSv, .5, 2.) / 1.5 / 2.5 * 100)
+
+# ------------------------------------------------------------------- driver
+def process_one(path, args):
+    cols, headers, meta = read_record(path)
+    ci = args.acc_col if args.acc_col is not None else (1 if len(cols) > 1 else 0)
+    if not 0 <= ci < len(cols):
+        raise ValueError(f'{path}: acceleration column {ci} out of range (0..{len(cols)-1})')
+    dt = args.dt or meta.get('dt')
+    if not dt:
+        raise ValueError(f'{path}: no time step - pass --dt')
+    g = args.g
+    fac = g if args.units == 'g' else UNIT_FACTOR[args.units]
+    acc = cols[ci].astype(float) * fac * args.scale
+    a = baseline_correct(acc, dt, args.baseline, args.bl_order, args.pre_event, args.bl_zero)
+    a = apply_filter(a, dt, args.filter, args.f1, args.f2, args.order, not args.acausal, args.family, args.rp)
+    v, d = integrate(a, dt)
+    T = np.logspace(np.log10(args.tmin), np.log10(args.tmax), args.nt)
+    sp = response_spectrum(a, dt, T, args.xi / 100.0, args.steps)
+    im = intensity_measures(a, v, d, dt, g, args.threshold)
+    im.update(spectral_im(sp, g))
+    stem = os.path.splitext(os.path.basename(path))[0]
+    if args.out:
+        os.makedirs(args.out, exist_ok=True)
+        np.savetxt(os.path.join(args.out, stem + '_timehistory.csv'),
+                   np.column_stack([np.arange(len(a)) * dt, a / g, v * 100, d * 100]),
+                   delimiter=',', header='time_s,acc_g,vel_cm_s,disp_cm', comments='', fmt='%.8e')
+        np.savetxt(os.path.join(args.out, stem + '_spectrum.csv'),
+                   np.column_stack([T, sp['Sa'] / g, sp['Sv'] * 100, sp['Sd'] * 100, sp['PSv'] * 100]),
+                   delimiter=',',
+                   header=f'T_s,Sa_g,Sv_cm_s,Sd_cm,PSv_cm_s   (xi={args.xi}%)', comments='', fmt='%.8e')
+        with open(os.path.join(args.out, stem + '_measures.json'), 'w') as fh:
+            json.dump({'file': path, 'column': headers[ci], 'dt': dt, 'units_in': args.units,
+                       'processing': {'baseline': args.baseline, 'bl_order': args.bl_order,
+                                      'filter': args.filter, 'f1': args.f1, 'f2': args.f2,
+                                      'order': args.order, 'causal': not args.acausal},
+                       'measures': im}, fh, indent=1)
+    return dict(file=os.path.basename(path), acc=a, vel=v, disp=d, dt=dt, im=im, g=g)
+
+def validate(res, ref_path, ref_cols, ref_units):
+    cols, headers, _ = read_record(ref_path)
+    fa = {'g': res['g'], 'cm/s2': .01, 'm/s2': 1.}[ref_units[0]]
+    fv = {'cm/s': .01, 'm/s': 1.}[ref_units[1]]
+    fd = {'cm': .01, 'm': 1.}[ref_units[2]]
+    print(f'\nvalidation against {os.path.basename(ref_path)}')
+    print(f'{"quantity":14s}{"peak computed":>16s}{"peak reference":>16s}'
+          f'{"peak err %":>12s}{"max |diff|":>14s}{"rms err %":>12s}{"corr":>12s}')
+    for name, mine, col, fac, disp, unit in (
+            ('acceleration', res['acc'], ref_cols[0], fa, 1 / res['g'], 'g'),
+            ('velocity',     res['vel'], ref_cols[1], fv, 100, 'cm/s'),
+            ('displacement', res['disp'], ref_cols[2], fd, 100, 'cm')):
+        if col is None or col < 0:
+            continue
+        ref = cols[col] * fac
+        n = min(len(mine), len(ref))
+        a, b = mine[:n] * disp, ref[:n] * disp
+        rel = 100 * np.sqrt(((a - b) ** 2).mean()) / np.sqrt((b ** 2).mean())
+        pk = 100 * (abs(a).max() - abs(b).max()) / abs(b).max()
+        print(f'{name:14s}{abs(a).max():16.6g}{abs(b).max():16.6g}{pk:12.4f}'
+              f'{abs(a-b).max():14.4e}{rel:12.4f}{np.corrcoef(a, b)[0,1]:12.8f}')
+
+def main():
+    p = argparse.ArgumentParser(description='Batch strong-motion processing (SeismoWeb companion)',
+                                formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument('files', nargs='+', help='record file(s); shell globs are expanded')
+    p.add_argument('--acc-col', type=int, default=None, help='0-based acceleration column')
+    p.add_argument('--dt', type=float, default=None, help='time step [s] (overrides the file header)')
+    p.add_argument('--units', default='g', choices=['g', 'm/s2', 'cm/s2', 'gal', 'mm/s2', 'in/s2'])
+    p.add_argument('--scale', type=float, default=1.0)
+    p.add_argument('--g', type=float, default=G_DEFAULT, help='gravity [m/s2]')
+    p.add_argument('--baseline', default='none', choices=['none', 'constant', 'acc-poly', 'vel-poly'])
+    p.add_argument('--bl-order', type=int, default=1)
+    p.add_argument('--pre-event', type=float, default=0.0, help='pre-event window [s]')
+    p.add_argument('--bl-zero', action='store_true', help='constrain v(0)=0 for vel-poly')
+    p.add_argument('--filter', default='none', choices=['none', 'lowpass', 'highpass', 'bandpass', 'bandstop'])
+    p.add_argument('--family', default='butter', choices=['butter', 'cheby1'])
+    p.add_argument('--rp', type=float, default=0.5, help='Chebyshev pass-band ripple [dB]')
+    p.add_argument('--f1', type=float, default=0.25, help='low corner [Hz]')
+    p.add_argument('--f2', type=float, default=25.0, help='high corner [Hz]')
+    p.add_argument('--order', type=int, default=4)
+    p.add_argument('--acausal', action='store_true', help='zero-phase forward-backward filtering')
+    p.add_argument('--xi', type=float, default=5.0, help='damping [%%]')
+    p.add_argument('--tmin', type=float, default=0.01)
+    p.add_argument('--tmax', type=float, default=5.0)
+    p.add_argument('--nt', type=int, default=150)
+    p.add_argument('--steps', type=int, default=40, help='min. integration steps per period')
+    p.add_argument('--threshold', type=float, default=0.05, help='bracketed-duration threshold [g]')
+    p.add_argument('--out', default=None, help='output directory')
+    p.add_argument('--validate', default=None, help='reference processed record to compare against')
+    p.add_argument('--ref-cols', default='1,2,3', help='0-based acc,vel,disp columns of the reference')
+    p.add_argument('--ref-units', default='g,cm/s,cm')
+    a = p.parse_args()
+    paths = []
+    for f in a.files:
+        paths += sorted(glob.glob(f)) or [f]
+    summary = []
+    for path in paths:
+        try:
+            r = process_one(path, a)
+        except Exception as exc:                                   # noqa: BLE001
+            print(f'{path}: ERROR - {exc}', file=sys.stderr); continue
+        im = r['im']
+        print(f"{r['file']:38s} n={im['npts']:>7d} dt={im['dt']:<7g} "
+              f"PGA={im['PGA_g']:.4f} g  PGV={im['PGV_cm_s']:.3f} cm/s  "
+              f"PGD={im['PGD_cm']:.3f} cm  Ia={im['Arias_Ia_m_s']:.4f} m/s  "
+              f"D5-95={im['D_5_95_s']:.2f} s")
+        summary.append({'file': r['file'], **im})
+        if a.validate:
+            rc = [int(x) if x.strip() != '' else -1 for x in a.ref_cols.split(',')]
+            while len(rc) < 3:
+                rc.append(-1)
+            validate(r, a.validate, rc, [s.strip() for s in a.ref_units.split(',')])
+    if a.out and summary:
+        os.makedirs(a.out, exist_ok=True)
+        keys = list(summary[0].keys())
+        with open(os.path.join(a.out, 'summary.csv'), 'w') as fh:
+            fh.write(','.join(keys) + '\n')
+            for row in summary:
+                fh.write(','.join(str(row.get(k, '')) for k in keys) + '\n')
+        print(f"\nwrote {len(summary)} record(s) to {a.out}/")
+
+if __name__ == '__main__':
+    main()
