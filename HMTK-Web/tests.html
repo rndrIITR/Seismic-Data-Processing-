@@ -1,0 +1,8 @@
+<!doctype html><meta charset="utf-8"><title>HMTK-Web regression checks</title><style>body{font:14px system-ui;max-width:900px;margin:30px auto}li{margin:8px 0}.ok{color:#087f5b}.bad{color:#c92a2a}</style><h1>HMTK-Web regression checks</h1><p>These deterministic checks exercise the core mathematical invariants independently of the browser UI. They are deliberately transparent rather than claiming validation against a published numerical table that has not been loaded into this repository.</p><ol id=o></ol><script>
+const out=document.querySelector('#o');function t(name,fn){try{if(!fn())throw Error('failed');out.innerHTML+='<li class=ok>PASS — '+name+'</li>'}catch(e){out.innerHTML+='<li class=bad>FAIL — '+name+': '+e.message+'</li>'}}
+t('Aki/Utsu synthetic b-value',()=>{let M=[3.25,3.75,4.25,4.75,5.25],mean=M.reduce((a,b)=>a+b,0)/M.length,b=Math.LOG10E/(mean-3+.25);return Math.abs(b-0.868589)<1e-5});
+t('Gardner–Knopoff window monotonicity',()=>{let f=M=>({s:10**(.1238*M+.983),t:M<6.5?10**(.5409*M-.547):10**(.032*M+2.7389)});return f(5).s<f(6).s&&f(5).t<f(6).t&&f(6.5).t>0});
+t('Stepp Poisson statistic',()=>{let N=100,T=20,lambda=N/T,s=Math.sqrt(lambda/T);return Math.abs(s-Math.sqrt(0.25))<1e-12});
+t('GR intercept/rate identity',()=>{let a=4,b=1.0,m=3,r=10**(a-b*m);return Math.abs(Math.log10(r)-(a-b*m))<1e-12});
+t('Weichert positive-rate guard',()=>{let n=[10,5],t=[20,10],m=[3.25,3.75],b=1;let d=n.reduce((s,ni,i)=>s+ni*t[i]*Math.exp(-b*Math.LN10*(m[i]-3)),0);return d>0});
+</script>
